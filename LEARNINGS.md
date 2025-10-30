@@ -2,6 +2,19 @@
 
 A chronological record of building reliability patterns from first principles.
 
+## 📚 Industry References
+
+This project implements patterns documented by leading engineering organizations:
+
+- **[AWS Builders' Library - Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/)**
+  Source for exponential backoff with full jitter implementation
+
+- **[Google SRE Book - Handling Overload](https://sre.google/sre-book/handling-overload/)**
+  Source for bounded queue and backpressure patterns
+
+- **[Stripe API - Idempotent Requests](https://docs.stripe.com/api/idempotent_requests)**
+  Source for 24-hour TTL idempotency implementation
+
 ---
 
 ## Step 1: Basic HTTP Server + Flaky Downstream
@@ -447,5 +460,436 @@ Better to reject early and let client retry than accept work we can't handle.
 
 ### What's Next
 In Step 4, we'll implement idempotency checking to prevent duplicate processing when clients retry requests.
+
+---
+
+## Step 4: Idempotency Store
+**Date:** October 30, 2025
+**Duration:** ~90 minutes
+
+### What We Built
+- `IdempotencyStore` class with in-memory caching and TTL expiration
+- Integration into `/relay` endpoint with optional idempotency key support
+- Automatic cleanup mechanism to prevent memory leaks
+- Support for detecting in-flight vs completed requests
+
+**Files Created/Modified:**
+- `src/core/idempotency-store.ts` - Idempotency cache with 24-hour TTL
+- `src/server.ts` - Added idempotency checking before processing
+
+### How It Works
+
+**The Idempotency Pattern:**
+```
+Client sends request with header: idempotency-key: unique-id-123
+
+Server checks cache:
+  1. Key not found → Mark as in-flight, process, cache result
+  2. Key found + status='in_flight' → Return 409 Conflict
+  3. Key found + status='completed' → Return cached response
+```
+
+**Why This Matters:**
+Without idempotency, network failures cause duplicate processing:
+- User clicks "Subscribe" → request sent
+- Network drops before response arrives
+- User clicks again (or client auto-retries)
+- Without idempotency: User charged twice ❌
+- With idempotency: Server returns cached "already subscribed" ✅
+
+**Status Tracking:**
+```typescript
+type IdempotencyStatus = 'in_flight' | 'completed';
+
+interface IdempotencyData {
+  status: IdempotencyStatus;
+  data?: any;              // Response payload (only for completed)
+  cachedTime: number;      // When first seen (for TTL)
+  httpStatusCode?: number; // HTTP status (only for completed)
+}
+```
+
+**Flow Diagram:**
+```
+Request arrives with idempotency-key
+         |
+         v
+    Check cache
+         |
+    +---------+---------+
+    |         |         |
+  Not      In-flight  Completed
+  found
+    |         |         |
+    v         v         v
+  Mark     Return    Return
+in-flight   409     cached
+    |              response
+    v
+ Process
+    |
+    v
+  Mark
+completed
+    |
+    v
+  Cache
+ result
+```
+
+### Test Results
+
+#### Test 1: First Request with Idempotency Key
+```bash
+curl -H "idempotency-key: test-1" ...
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "message": "Processed successfully",
+    "timestamp": "2025-10-30T12:58:16.978Z"
+  },
+  "metadata": {
+    "processingTimeMs": 104,
+    "attempts": 1
+  }
+}
+```
+
+**Server logs:**
+```
+[IDEMPOTENCY] 🆕 New request, marking as in-flight: test-1
+[RELAY] ✅ Enqueued successfully, processing now...
+[RETRY] Attempt 1/4
+[RETRY] Success on attempt 1 (total time: 103ms)
+[IDEMPOTENCY] 💾 Cached successful response for key: test-1
+```
+
+---
+
+#### Test 2: Duplicate Request (Same Key)
+```bash
+curl -H "idempotency-key: test-1" ...
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "message": "Processed successfully",
+    "timestamp": "2025-10-30T12:58:16.978Z"  // Same timestamp!
+  },
+  "metadata": {
+    "processingTimeMs": 104,  // Same metadata!
+    "attempts": 1
+  }
+}
+```
+
+**Server logs:**
+```
+[IDEMPOTENCY] ✅ Returning cached response for key: test-1
+```
+
+**Key Observation:**
+- Response returned **instantly** (no retry logs)
+- **Exact same timestamp** as first request
+- Proves response was cached, not reprocessed
+
+---
+
+#### Test 3: Request Without Idempotency Key
+```bash
+curl ...  # No idempotency-key header
+```
+
+**Result:** Request processed normally. Idempotency is **optional**.
+
+---
+
+### Design Decisions
+
+**TTL: 24 Hours**
+- Following Stripe's approach
+- Long enough for client retries during incidents
+- Short enough to not grow unbounded
+- Formula: `Date.now() > cachedTime + 24 * 60 * 60 * 1000`
+
+**Why 24 hours?**
+- Client might retry after network partition resolves (hours later)
+- Manual retries from support team investigating issues
+- Balance between safety and memory usage
+
+**In-Memory Storage**
+- Simple, fast, no external dependencies
+- ❌ Lost on restart (acceptable for learning project)
+- ❌ Not shared across instances
+- Production would use Redis or DynamoDB
+
+**Only Cache Successes (2xx Status Codes)**
+```typescript
+if (retryResult.success) {
+  idempotencyStore.markCompleted(key, 200, response);
+} else {
+  // Don't cache failures - client should retry
+}
+```
+
+**Why not cache failures?**
+- Failures are often transient (network blip, downstream overload)
+- If we cache "503 Service Unavailable", client can never retry successfully
+- Only successful operations should be idempotent
+
+**Status: 'in_flight' vs 'completed'**
+Prevents concurrent duplicate requests:
+- Request A arrives with key "abc" → marked in-flight
+- Request B arrives with same key (client impatient) → 409 Conflict
+- Request A completes → marked completed
+- Request C arrives with same key → return cached response
+
+Without `in_flight` status, concurrent requests could both process.
+
+**409 Conflict vs Other Status Codes**
+- **409 Conflict**: Correct semantic for "duplicate in progress"
+- Not 429 (rate limit) or 503 (service unavailable)
+- Client should wait and retry, or poll for result
+
+**Automatic Cleanup**
+```typescript
+setInterval(() => {
+  this.cleanup();
+}, 10 * 60 * 1000); // Every 10 minutes
+```
+
+Without cleanup, expired entries stay in memory forever → memory leak.
+
+**Optional Idempotency**
+```typescript
+if (idempotencyKey) {
+  // Check cache
+}
+// If no key, process normally
+```
+
+Why optional?
+- Not all operations need idempotency (GET requests)
+- Client controls whether to use it
+- Simpler for non-critical operations
+
+### Problems Solved
+
+✅ **Prevents duplicate processing** - Same key = same result
+✅ **Safe client retries** - Client can retry without fear of duplicates
+✅ **Handles network failures** - Client doesn't know if first request succeeded
+✅ **Concurrent request detection** - Returns 409 for in-flight duplicates
+✅ **Memory bounded** - TTL + cleanup prevents unbounded growth
+
+### Remaining Problems
+
+❌ **Not distributed** - In-memory only, lost on restart
+❌ **No persistence** - Can't recover state after crash
+❌ **No worker pool** - Still processing synchronously
+❌ **No DLQ** - Failed requests after max retries are lost
+
+### Key Insights to Share
+
+1. **Idempotency is critical for payment/subscription systems** - Without it, network retries create duplicate charges. This is why Stripe makes idempotency keys a first-class concept.
+
+2. **Only cache successful responses** - Failures are transient. If you cache "503 Service Unavailable", client can never retry successfully. Only 2xx responses should be cached.
+
+3. **TTL prevents unbounded memory growth** - Without TTL, cache grows forever. Stripe uses 24 hours because clients might retry after long network partitions.
+
+4. **In-flight status prevents concurrent duplicates** - Without tracking in-flight requests, two concurrent requests with the same key could both process. The `in_flight` status returns 409 to the second request.
+
+5. **Idempotency should be optional** - Not all operations need it (GET requests are naturally idempotent). Making it optional reduces complexity for simple operations.
+
+6. **Client generates the key, not the server** - Server can't know what makes requests "the same". Client sends key (often UUID) based on their business logic.
+
+7. **Why 409 Conflict is the right status code:**
+   - 409 Conflict: "Duplicate request in progress" (correct)
+   - 429 Too Many Requests: "Rate limit exceeded" (wrong semantic)
+   - 503 Service Unavailable: "Service is down" (wrong semantic)
+
+8. **The cached response timestamp proves idempotency works:**
+   - First request: `timestamp: "2025-10-30T12:58:16.978Z"`
+   - Duplicate request: `timestamp: "2025-10-30T12:58:16.978Z"` (exact same!)
+   - This proves the second request returned cached data, not reprocessing
+
+### Relevance to Payment and Subscription Systems
+
+Idempotency is particularly critical in payment and subscription systems where duplicate processing creates financial consequences. Common scenarios include:
+
+- **Subscription creation**: Network drop after charge succeeds → client retries → without idempotency: double charge
+- **Webhook processing**: Payment provider retries webhooks if no 200 response → without idempotency: duplicate entitlement updates
+- **Refund processing**: Support retries refund request → without idempotency: double refund
+
+This pattern is why Stripe makes idempotency keys a first-class concept in their API design.
+
+### What's Next
+In Step 5, we'll implement a worker pool to limit concurrency and properly demonstrate bounded queue backpressure.
+
+---
+
+## 🎯 Project Summary: Steps 1-4 Complete
+
+**Completion Date:** October 30, 2025
+**Total Time:** ~4 hours across 3 sessions
+**Status:** ✅ Core patterns implemented and tested
+
+### What We Built
+
+**Core Components:**
+1. ✅ **RetryManager** - Exponential backoff with full jitter, hard timeouts
+2. ✅ **BoundedQueue** - Fixed capacity (100), returns 429 when full
+3. ✅ **IdempotencyStore** - 24-hour TTL, prevents duplicate processing
+
+**API Endpoints:**
+- ✅ `POST /relay` - Forward requests with retry, queue, and idempotency
+- ✅ `GET /health` - Health check
+
+**Configuration-Driven:**
+- All tunable parameters in `src/config.ts`
+- Easy to experiment with different values
+- Follows production best practices
+
+### Key Patterns Demonstrated
+
+1. **Retry with Exponential Backoff + Jitter**
+   - Success rate: 70% → 99%+ with retries
+   - Prevents thundering herd with full jitter
+   - Hard timeouts prevent hanging
+
+2. **Bounded Queue with Backpressure**
+   - Fixed capacity prevents OOM
+   - Returns 429 when full (fail fast)
+   - **Note:** Needs worker pool for true throughput control
+
+3. **Idempotency**
+   - Prevents duplicate charges/subscriptions
+   - 24-hour TTL (Stripe's approach)
+   - Detects concurrent duplicates (409 Conflict)
+   - Only caches successful responses
+
+### The Worker Pool Gap (Steps 5-7 Not Implemented)
+
+**What's Missing:**
+
+**Worker Pool** - The key to true backpressure:
+```
+Current state (Steps 1-4):
+  Request → Enqueue → Immediately dequeue → Process → Done
+  Queue never fills up because Node.js processes all concurrently
+  Result: Bounded capacity checking, but no throughput control
+
+With worker pool (Step 5):
+  Request → Enqueue → Return immediately
+  5 workers continuously pull from queue
+  When workers busy AND queue full → 429
+  Result: True backpressure, observable 429s, controlled throughput
+```
+
+**Why it matters:**
+- **Bounded queue alone** = Capacity checking (prevents unbounded growth)
+- **Bounded queue + worker pool** = Throughput control (limits concurrent processing)
+
+The bounded queue we built is production-ready and prevents OOM. But without a worker pool limiting concurrency, you'll never see the queue fill up or generate 429s under normal load.
+
+**Other Deferred Patterns:**
+- **Dead Letter Queue (Step 6)** - Quarantine failed work for manual inspection
+- **Observability (Step 7)** - RED metrics (Rate, Errors, Duration)
+
+**When to implement:**
+- Worker pool: When you want to see true backpressure in action
+- DLQ: When you need to debug failed requests
+- RED metrics: When you need observability for monitoring
+
+### What Makes This Project Valuable
+
+**Learning from first principles:**
+- Built from industry documentation, not copying code
+- Tested and debugged real issues (queue not filling up)
+- Documented trade-offs and design decisions
+- Discovered limitations through testing (queue needs worker pool)
+
+**Demonstrates systems thinking:**
+- Read industry docs first (AWS, Google SRE, Stripe)
+- Implemented patterns correctly (full jitter, TTL, 409 status codes)
+- Can explain when to use each pattern and why
+- Identified what's missing and why it matters
+
+### Files Created
+
+```
+src/
+├── config.ts                    # All tunable parameters
+├── types.ts                     # TypeScript interfaces
+├── server.ts                    # Express HTTP server
+├── core/
+│   ├── retry-manager.ts        # Retry with backoff + jitter
+│   ├── bounded-queue.ts        # Fixed-capacity FIFO queue
+│   └── idempotency-store.ts    # 24-hour TTL cache
+└── downstream/
+    └── flaky-client.ts          # Simulated unreliable service
+
+LEARNINGS.md                     # Detailed documentation (775 lines)
+LEARNING_PLAN.md                 # Progress tracking
+```
+
+### Next Steps
+
+**To complete the full resilience pattern set:**
+1. Implement worker pool to see true backpressure
+2. Add DLQ for failed request quarantine
+3. Add RED metrics for observability
+
+**To extend and experiment:**
+- Test with different configuration values
+- Compare jitter strategies (no jitter vs full jitter)
+- Experiment with queue sizing
+- Measure performance impact of each pattern
+
+### Time Investment Summary
+
+- **Step 1 (Basic server):** 30 minutes
+- **Step 2 (Retry):** 45 minutes
+- **Step 3 (Bounded queue):** 60 minutes
+- **Step 4 (Idempotency):** 90 minutes
+- **Documentation:** Continuous throughout
+- **Total:** ~4 hours for production-grade patterns
+
+**ROI:**
+- 4 hours invested
+- 3 production patterns mastered
+- Deep understanding of trade-offs
+- Hands-on experience with industry-standard reliability patterns
+
+---
+
+## 📚 Further Reading (For Worker Pool Implementation)
+
+If you decide to implement Step 5 (Worker Pool) later:
+
+**Concepts to review:**
+- Node.js event loop and async patterns
+- Queue-worker architecture
+- Callback vs promise vs async/await for completion notification
+- Graceful shutdown (wait for in-flight work)
+
+**Estimated time:** 60-90 minutes
+
+**What you'll learn:**
+- How to limit concurrency with worker pools
+- Why this finally makes the bounded queue fill up
+- How to handle async request completion
+- Production patterns for background job processing
+
+**When to do it:**
+- Want to complete the full resilience story
+- Curious to see 429s in action
+- Want to understand concurrency control patterns
 
 ---

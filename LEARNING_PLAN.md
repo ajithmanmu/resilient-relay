@@ -1,75 +1,246 @@
 # Resilient Relay - Learning Plan
 
-## Phase 1: Reading & Understanding (Do This First)
+## 🎯 Project Status: Steps 1-4 Complete
 
-Read these in order. After each, we'll implement that specific pattern.
+**Completed:** October 27-30, 2025
+**Time Investment:** ~4 hours across 3 sessions
+**Core Patterns Implemented:** Retry, Bounded Queue, Idempotency
 
-### 1. AWS Builders' Library — Timeouts, retries, and backoff with jitter
+---
+
+## Phase 1: Reading & Understanding
+
+### ✅ 1. AWS Builders' Library — Timeouts, retries, and backoff with jitter
 **Read:** https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/
 
-**Key takeaways to look for:**
-- Why exponential backoff without jitter creates "thundering herd"
-- How full jitter spreads retry load evenly
-- Why hard timeouts on outbound calls are non-negotiable
+**Status:** ✅ COMPLETED - October 27, 2025
 
-**After reading, we'll implement:**
-- `RetryManager` class with exponential backoff + full jitter
-- Timeout wrapper using `Promise.race()`
+**Key takeaways learned:**
+- Exponential backoff without jitter creates "thundering herd"
+- Full jitter spreads retry load evenly across time
+- Hard timeouts prevent hanging on slow downstream services
+
+**Implemented:**
+- ✅ `RetryManager` class with exponential backoff + full jitter
+- ✅ Timeout wrapper using `Promise.race()`
+- ✅ Tested with 30% and 80% failure rates
 
 ---
 
-### 2. Google SRE Book — Handling Overload
+### ✅ 2. Google SRE Book — Handling Overload
 **Read:** https://sre.google/sre-book/handling-overload/
 
-**Key takeaways to look for:**
-- Why returning 429/503 early is better than accepting work you'll drop
-- Graceful degradation vs falling over
-- Shedding load at the edge
+**Status:** ✅ COMPLETED - October 28, 2025
 
-**After reading, we'll implement:**
-- `BoundedQueue` with fixed capacity
-- HTTP endpoint that returns 429 when queue is full
+**Key takeaways learned:**
+- Returning 429/503 early (fail fast) is better than accepting work you'll drop
+- Adaptive throttling at client side (track accepts vs requests)
+- **Critical:** Retry only one layer above to prevent exponential amplification
+- Request criticality ranking (Critical, Critical+Shareable, Shareable)
+- Per-client quotas prevent noisy neighbor problem
+
+**Implemented:**
+- ✅ `BoundedQueue` with fixed capacity (100 items)
+- ✅ Returns 429 when queue full
+- ✅ **Key Discovery:** Queue needs worker pool for true backpressure (see notes below)
+
+**Important Note on Worker Pools:**
+During testing, we discovered the bounded queue never filled up because we process requests synchronously. Node.js handles all requests concurrently, so the queue never builds up. **True backpressure requires a worker pool** (Step 5) to limit concurrency. Without it, the queue is just capacity checking, not throughput control.
 
 ---
 
-### 3. Stripe — Idempotent requests
+### ✅ 3. Stripe — Idempotent requests
 **Read:** https://docs.stripe.com/api/idempotent_requests
 
-**Key takeaways to look for:**
-- How idempotency keys prevent duplicate processing
-- 24-hour TTL for cached results
-- Client-side key generation
+**Status:** ✅ COMPLETED - October 30, 2025
 
-**After reading, we'll implement:**
-- `IdempotencyStore` with key → result mapping
-- Duplicate detection in the API endpoint
+**Key takeaways learned:**
+- Idempotency keys prevent duplicate processing during retries
+- 24-hour TTL (Stripe's approach)
+- Client generates keys (server can't know what makes requests "the same")
+- Only cache successful responses (failures should be retryable)
+- Track in-flight vs completed status to handle concurrent duplicates
+
+**Implemented:**
+- ✅ `IdempotencyStore` with 24-hour TTL
+- ✅ Duplicate detection in `/relay` endpoint
+- ✅ Returns 409 Conflict for in-flight duplicates
+- ✅ Returns cached response for completed requests
+- ✅ Optional feature (only if client provides key)
+- ✅ Automatic cleanup every 10 minutes
 
 ---
 
-### 4. AWS SQS Docs — Dead-letter queues
+### ⏸️ 4. AWS SQS Docs — Dead-letter queues
 **Read:** https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html
 
-**Key takeaways to look for:**
-- DLQ is a quarantine, not a trash can
-- `maxReceiveCount` determines when messages move to DLQ
-- Manual inspection and replay workflow
+**Status:** ⏸️ NOT STARTED (Future Enhancement)
 
-**After reading, we'll implement:**
+**What it would implement:**
 - `DeadLetterQueue` for exhausted retries
 - Inspection endpoint: `GET /dlq`
+- Manual replay capability
+
+**Why it matters:**
+- Quarantine failed work instead of dropping it
+- Enable manual inspection and debugging
+- Support replay after fixing root cause
 
 ---
 
-### 5. Grafana RED Method
+### ⏸️ 5. Grafana RED Method
 **Read:** https://grafana.com/blog/2018/08/02/the-red-method-how-to-instrument-your-services/
 
-**Key takeaways to look for:**
-- Minimum observability: Rate, Errors, Duration
-- Why these 3 metrics tell you if a service is healthy
+**Status:** ⏸️ NOT STARTED (Future Enhancement)
 
-**After reading, we'll implement:**
+**What it would implement:**
+- `StatsCollector` for RED metrics (Rate, Errors, Duration)
+- Enhanced `/health` endpoint
+- New `/stats` endpoint
+
+**Why it matters:**
+- Minimum observability for production services
+- Track request rate, error rate, latency percentiles
+- Determine service health at a glance
+
+---
+
+## Phase 2: Implementation Progress
+
+### ✅ Step 1: Basic HTTP Server + Flaky Downstream
+**Status:** ✅ COMPLETED - October 27, 2025
+**Duration:** ~30 minutes
+
+**What we built:**
+- Express server with `/relay` and `/health` endpoints
+- Simulated flaky downstream (30% failure rate)
+- TypeScript types and configuration system
+
+**Key learning:** Without resilience patterns, 30% of requests fail permanently.
+
+---
+
+### ✅ Step 2: Retry with Backoff + Jitter
+**Status:** ✅ COMPLETED - October 27, 2025
+**Duration:** ~45 minutes
+
+**What we built:**
+- `RetryManager` with exponential backoff + full jitter
+- Hard timeouts (5 seconds per attempt)
+- Max 3 retries (4 total attempts)
+
+**Key learning:** Retry improved success rate from 70% → 99%+ with proper backoff.
+
+**Results:**
+- 30% failure rate → 99.19% eventual success
+- Latency trade-off: ~100ms first attempt, ~500ms after retries
+
+---
+
+### ✅ Step 3: Bounded Queue + Backpressure
+**Status:** ✅ COMPLETED - October 28, 2025
+**Duration:** ~60 minutes
+
+**What we built:**
+- `BoundedQueue` with capacity 100
+- Returns 429 when full
+- FIFO semantics
+
+**Key learning:** **Bounded queues need worker pools for true backpressure.** Without limited workers, Node.js processes all requests concurrently and the queue never fills up. The queue provides capacity checking but not throughput control.
+
+**What's missing:** Worker pool (Step 5) to limit concurrency and actually fill the queue.
+
+---
+
+### ✅ Step 4: Idempotency Store
+**Status:** ✅ COMPLETED - October 30, 2025
+**Duration:** ~90 minutes
+
+**What we built:**
+- `IdempotencyStore` with 24-hour TTL
+- Integration into `/relay` endpoint
+- Detects in-flight vs completed requests
+- Returns 409 for concurrent duplicates
+
+**Key learning:** Idempotency is critical for payment/subscription systems. Without it, network retries cause duplicate charges.
+
+**Test results:**
+- First request: Processed and cached
+- Duplicate request: Returned cached response instantly (same timestamp!)
+- Proved idempotency working correctly
+
+---
+
+### ⏸️ Step 5: Worker Pool (NOT IMPLEMENTED - Future Work)
+**Status:** ⏸️ DEFERRED
+
+**What it would implement:**
+- `WorkerPool` with fixed number of workers (e.g., 5)
+- Workers continuously pull from queue
+- True async processing (enqueue and return immediately)
+- Callback mechanism for request completion
+
+**Why it matters - THE MISSING PIECE FOR BACKPRESSURE:**
+
+Without worker pool:
+```
+Request arrives → Enqueue → Immediately dequeue → Process with await → Done
+Queue size: always 0 (never builds up)
+Result: No 429s, no backpressure
+```
+
+With worker pool:
+```
+Request arrives → Enqueue → Return immediately
+5 workers continuously processing from queue
+When all workers busy AND queue full → Return 429
+Result: True backpressure, observable 429s
+```
+
+**The key insight:**
+Bounded queue alone = capacity checking
+Bounded queue + worker pool = throughput control + backpressure
+
+**When to implement:**
+- When you want to see the queue actually fill up and generate 429s
+- When you want to complete the full resilience pattern story
+- When you want to see true backpressure in action
+
+**Estimated time:** ~60-90 minutes
+
+---
+
+### ⏸️ Step 6: Dead Letter Queue (NOT IMPLEMENTED - Future Work)
+**Status:** ⏸️ DEFERRED
+
+**What it would implement:**
+- `DeadLetterQueue` for requests that fail after max retries
+- Inspection endpoint: `GET /dlq`
+- Manual replay capability
+
+**Why it matters:**
+- Currently, failed requests after max retries are just logged and lost
+- DLQ quarantines them for manual inspection
+- Enables debugging and replay after fixing root cause
+
+**Estimated time:** ~30 minutes
+
+---
+
+### ⏸️ Step 7: Observability (NOT IMPLEMENTED - Future Work)
+**Status:** ⏸️ DEFERRED
+
+**What it would implement:**
 - `StatsCollector` for RED metrics
-- Endpoints: `GET /health` and `GET /stats`
+- Enhanced `/health` endpoint with metrics
+- New `/stats` endpoint
+
+**Why it matters:**
+- Production services need observability
+- RED metrics (Rate, Errors, Duration) tell you if service is healthy
+- Critical for on-call debugging
+
+**Estimated time:** ~30 minutes
 
 ---
 
@@ -207,7 +378,7 @@ As we implement each pattern, we'll document:
 - **What config knobs matter?**
 - **What default values did we choose and why?**
 
-This becomes your interview talking points.
+This helps solidify understanding and provides valuable documentation.
 
 ---
 
